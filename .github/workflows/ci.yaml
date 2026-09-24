@@ -12,9 +12,6 @@ on:
       - "**/*.md"
       - "LICENSE"
 
-env:
-  GO_VERSION: "1.21.x"
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,10 +19,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
           cache: true
 
+      # Tests the latest coraza-http-wasm release against the local manifest,
+      # so changes in this repository are validated before being released.
       - name: Run e2e tests
-        run: go run mage.go e2e
+        run: go run mage.go e2eLocal
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

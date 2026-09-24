@@ -4,7 +4,17 @@
 
 This repository publishes the coraza-http-wasm as a plugin and also contains examples on how to run coraza-http-wasm as a traefik plugin.
 
-The wasm executable is built in the [coraza-http-wasm](https://github.com/jcchavezs/coraza-http-wasm/tree/main) repository.
+The wasm executable is built in the [coraza-http-wasm](https://github.com/bardagi/coraza-http-wasm/tree/main) repository.
+
+To use the plugin in your own Traefik instance, add it to the static configuration:
+
+```yaml
+experimental:
+  plugins:
+    coraza:
+      moduleName: github.com/bardagi/coraza-http-wasm-traefik
+      version: v0.4.1
+```
 
 ## Getting started
 
@@ -36,3 +46,11 @@ http:
 ```
 
 For more information about the available directives go to [coraza docs](https://coraza.io/docs).
+
+## Performance
+
+The example configuration enables `SecDebugLogLevel 9`, which logs every rule evaluation to stdout and is very expensive. In anything beyond local experiments:
+
+- Remove `SecDebugLog`/`SecDebugLogLevel`, or keep the level at 0-3.
+- Only enable `SecRequestBodyAccess`/`SecResponseBodyAccess` when you have rules that inspect bodies, and restrict `SecResponseBodyMimeType` to the content types you need, since body inspection requires buffering.
+- Set `SecRequestBodyLimit`/`SecResponseBodyLimit` to sensible values for your traffic.

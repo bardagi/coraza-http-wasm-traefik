@@ -9,41 +9,59 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
+	"time"
 
 	_ "embed"
 
 	"github.com/magefile/mage/sh"
 )
 
+const (
+	// httpWasmRepo is the GitHub repository publishing the coraza-http-wasm binary.
+	httpWasmRepo = "bardagi/coraza-http-wasm"
+	artifactURL  = "https://github.com/" + httpWasmRepo + "/releases/download/{version}/coraza-http-wasm-{version}.zip"
+	buildDir     = "build"
+)
+
+var httpClient = &http.Client{Timeout: 5 * time.Minute}
+
 func download(url, dst string) error {
 	fmt.Printf("Downloading %s to %s\n", url, dst)
-	// Create the file
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
 
-	// Get the data
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
+	// Check the status before creating the file so a failed download does not
+	// leave an empty or partial file behind.
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
+		return fmt.Errorf("downloading %s: bad status: %s", url, resp.Status)
 	}
 
-	// Write the body to file
-	_, err = io.Copy(out, resp.Body)
+	return writeFile(dst, resp.Body)
+}
+
+// writeFile writes r to dst, removing dst if anything fails.
+func writeFile(dst string, r io.Reader) (err error) {
+	out, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(dst)
+		}
+	}()
 
-	return nil
+	_, err = io.Copy(out, r)
+	return err
 }
 
 func unzip(name string) error {
@@ -54,24 +72,12 @@ func unzip(name string) error {
 	}
 	defer reader.Close()
 
+	dir := filepath.Dir(name)
 	for _, file := range reader.File {
-		in, err := file.Open()
-		if err != nil {
-			return err
+		if file.FileInfo().IsDir() {
+			continue
 		}
-		defer in.Close()
-
-		dir := path.Dir(name)
-		os.MkdirAll(dir, 0777)
-
-		out, err := os.Create(path.Join(dir, file.Name))
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-
-		_, err = io.Copy(out, in)
-		if err != nil {
+		if err := extractFile(file, dir); err != nil {
 			return err
 		}
 	}
@@ -79,36 +85,56 @@ func unzip(name string) error {
 	return nil
 }
 
-const artifactURL = "https://github.com/jcchavezs/coraza-http-wasm/releases/download/{version}/coraza-http-wasm-{version}.zip"
+func extractFile(file *zip.File, dir string) error {
+	// Guard against zip-slip: entries must not escape the target directory.
+	dst := filepath.Join(dir, file.Name)
+	if !strings.HasPrefix(dst, filepath.Clean(dir)+string(os.PathSeparator)) {
+		return fmt.Errorf("illegal file path in archive: %s", file.Name)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	in, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	return writeFile(dst, in)
+}
 
 func downloadHTTPWasmArtifact(version, dir string) error {
-	url := strings.Replace(artifactURL, "{version}", version, 2)
-	if err := download(url, path.Join(dir, "coraza-http-wasm.zip")); err != nil {
+	url := strings.ReplaceAll(artifactURL, "{version}", version)
+	zipPath := filepath.Join(dir, "coraza-http-wasm.zip")
+	if err := download(url, zipPath); err != nil {
 		return err
 	}
+	defer os.Remove(zipPath)
 
-	if err := unzip(path.Join(dir, "coraza-http-wasm.zip")); err != nil {
-		return err
-	}
-
-	return os.Remove(path.Join(dir, "coraza-http-wasm.zip"))
+	return unzip(zipPath)
 }
 
 func getHttpWasmVersion() (string, error) {
-	version := os.Getenv("VERSION")
+	if version := os.Getenv("VERSION"); version != "" {
+		return version, nil
+	}
+
+	// releases/latest skips drafts and pre-releases, unlike the first entry of
+	// the releases list.
+	version, err := sh.Output("gh", "api", "repos/"+httpWasmRepo+"/releases/latest", "-q", ".tag_name")
+	if err != nil {
+		return "", err
+	}
 	if version == "" {
-		var err error
-		version, err = sh.Output("gh", "api", "repos/jcchavezs/coraza-http-wasm/releases", "-q", ".[0].tag_name")
-		if err != nil {
-			return "", err
-		}
+		return "", fmt.Errorf("no release found for %s", httpWasmRepo)
 	}
 	return version, nil
 }
 
 func DownloadArtifact() error {
-	var err error
-	if err = os.Mkdir("build", 0755); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(buildDir, 0755); err != nil {
 		return err
 	}
 
@@ -117,24 +143,17 @@ func DownloadArtifact() error {
 		return err
 	}
 
-	return downloadHTTPWasmArtifact(version, "./build")
+	return downloadHTTPWasmArtifact(version, buildDir)
 }
 
-func copy(src, dst string) error {
+func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	return err
+	return writeFile(dst, in)
 }
 
 type e2eSource string
@@ -148,8 +167,9 @@ func e2e(source e2eSource) error {
 	var err error
 
 	dockerComposeArgs := []string{"compose", "-f", "docker-compose.yml", "-f", "e2e/docker-compose.e2e.yml"}
+	service := "e2e_traefik_" + string(source)
 
-	if err = sh.RunV("docker", append(dockerComposeArgs, "up", "-d", "e2e_traefik_"+string(source))...); err != nil {
+	if err = sh.RunV("docker", append(dockerComposeArgs, "up", "-d", service)...); err != nil {
 		return err
 	}
 	defer func() {
@@ -167,7 +187,7 @@ func e2e(source e2eSource) error {
 
 	if err = sh.RunV("go", "run", "github.com/corazawaf/coraza/v3/http/e2e/cmd/httpe2e@main", "--proxy-hostport",
 		"http://"+proxyHost, "--httpbin-hostport", "http://"+httpbinHost); err != nil {
-		sh.RunV("docker", append(dockerComposeArgs, "logs", "traefik")...)
+		_ = sh.RunV("docker", append(dockerComposeArgs, "logs", service)...)
 	}
 
 	return err
@@ -178,11 +198,13 @@ func E2E() error {
 }
 
 func E2ELocal() error {
-	if err := copy(".traefik.yml", "build/.traefik.yml"); err != nil {
+	// DownloadArtifact creates the build directory, so it must run before
+	// copying the manifest into it.
+	if err := DownloadArtifact(); err != nil {
 		return err
 	}
 
-	if err := DownloadArtifact(); err != nil {
+	if err := copyFile(".traefik.yml", filepath.Join(buildDir, ".traefik.yml")); err != nil {
 		return err
 	}
 
@@ -193,11 +215,12 @@ func E2ELocal() error {
 var staticConfig string
 
 func UpdateVersion() error {
-	if os.Getenv("VERSION") == "" {
+	version := os.Getenv("VERSION")
+	if version == "" {
 		return errors.New("VERSION environment variable is not set")
 	}
 
-	renderedStaticConfig := strings.Replace(staticConfig, "{{version}}", os.Getenv("VERSION"), 1)
+	renderedStaticConfig := strings.ReplaceAll(staticConfig, "{{version}}", version)
 
 	return errors.Join(
 		os.WriteFile("config-static.yaml", []byte(renderedStaticConfig), 0644),

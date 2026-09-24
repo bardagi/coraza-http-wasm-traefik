@@ -1,8 +1,6 @@
-version: '3.7'
-
 services:
   traefik_base:
-    image: traefik:v3.2.0
+    image: traefik:v3.7.13
     ports:
       - 8080:80
     command:
@@ -16,7 +14,7 @@ services:
       - httpbin
 
   httpbin:
-    image: mccutchen/go-httpbin:v2.9.0
+    image: mccutchen/go-httpbin:v2.25.0
     environment:
       - APP_NAME=httpbin
       - MAX_BODY_SIZE=15728640 # 15 MiB
