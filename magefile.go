@@ -185,12 +185,138 @@ func e2e(source e2eSource) error {
 		httpbinHost = "localhost:8000"
 	}
 
-	if err = sh.RunV("go", "run", "github.com/corazawaf/coraza/v3/http/e2e/cmd/httpe2e@main", "--proxy-hostport",
-		"http://"+proxyHost, "--httpbin-hostport", "http://"+httpbinHost); err != nil {
+	if err = runE2ETests("http://"+proxyHost, "http://"+httpbinHost); err != nil {
 		_ = sh.RunV("docker", append(dockerComposeArgs, "logs", service)...)
 	}
 
 	return err
+}
+
+// blockedBody is the response body coraza-http-wasm returns on interruptions.
+const blockedBody = "Request blocked\n"
+
+type e2eTestCase struct {
+	name, method, path, body, userAgent string
+	status                              int
+	missingConfigHeader                 bool
+}
+
+// e2eTestCases mirror the scenarios of corazawaf/coraza's httpe2e suite, whose
+// runner requires empty denial bodies whereas coraza-http-wasm returns a
+// generic message. They match the rules in e2e/config-dynamic.yaml.
+var e2eTestCases = []e2eTestCase{
+	{name: "configuration", method: "GET", path: "/", status: 424, missingConfigHeader: true},
+	{name: "allowed", method: "GET", path: "/?arg=arg_1", status: 200},
+	{name: "URI deny", method: "GET", path: "/admin", status: 403},
+	{name: "allowed body", method: "POST", path: "/anything", body: "This is a legit payload", status: 200},
+	{name: "request body deny", method: "POST", path: "/anything", body: "maliciouspayload", status: 403},
+	{name: "response header deny", method: "GET", path: "/response-headers?pass=leak", status: 403},
+	{name: "response body deny", method: "POST", path: "/anything", body: "responsebodycode", status: 403},
+	{name: "XSS", method: "GET", path: "/anything?arg=%3Cscript%3Ealert(0)%3C/script%3E", status: 403},
+	{name: "SQLi", method: "POST", path: "/anything", body: "1%27%20ORDER%20BY%203--%2B", status: 403},
+	{name: "scanner", method: "GET", path: "/anything", userAgent: "Grabber/0.1 (X11; U; Linux i686; en-US; rv:1.7)", status: 403},
+}
+
+func runE2ETests(proxyURL, httpbinURL string) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Traefik may need a while to fetch and compile the plugin, so wait until
+	// both the upstream and the proxy (with the WAF active) respond.
+	if err := waitForStatus(client, httpbinURL+"/status/200", nil, http.StatusOK); err != nil {
+		return err
+	}
+	if err := waitForStatus(client, proxyURL+"/", http.Header{"Coraza-E2e": {"ok"}}, http.StatusOK); err != nil {
+		return err
+	}
+
+	var failed int
+	for i, tc := range e2eTestCases {
+		fmt.Printf("[%d/%d] %s: ", i+1, len(e2eTestCases), tc.name)
+		if err := runE2ETestCase(client, proxyURL, tc); err != nil {
+			failed++
+			fmt.Printf("FAIL: %v\n", err)
+			continue
+		}
+		fmt.Println("ok")
+	}
+
+	if failed > 0 {
+		return fmt.Errorf("%d of %d e2e tests failed", failed, len(e2eTestCases))
+	}
+	return nil
+}
+
+func runE2ETestCase(client *http.Client, proxyURL string, tc e2eTestCase) error {
+	req, err := http.NewRequest(tc.method, proxyURL+tc.path, strings.NewReader(tc.body))
+	if err != nil {
+		return err
+	}
+	if !tc.missingConfigHeader {
+		req.Header.Set("coraza-e2e", "ok")
+	}
+	if tc.body != "" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if tc.userAgent != "" {
+		req.Header.Set("User-Agent", tc.userAgent)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != tc.status {
+		return fmt.Errorf("expected status %d, got %d", tc.status, resp.StatusCode)
+	}
+	if tc.status == http.StatusOK {
+		return nil
+	}
+
+	if string(body) != blockedBody {
+		return fmt.Errorf("expected body %q, got %q", blockedBody, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		return fmt.Errorf("unexpected Content-Type %q", ct)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		return fmt.Errorf("unexpected Cache-Control %q", cc)
+	}
+	return nil
+}
+
+func waitForStatus(client *http.Client, url string, header http.Header, status int) error {
+	const timeout = 60 * time.Second
+	fmt.Printf("Waiting for %s to return %d\n", url, status)
+
+	var lastErr error
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(time.Second) {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		req.Header = header.Clone()
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == status {
+			return nil
+		}
+		lastErr = fmt.Errorf("got status %d", resp.StatusCode)
+	}
+
+	return fmt.Errorf("timeout waiting for %s: %v", url, lastErr)
 }
 
 func E2E() error {
